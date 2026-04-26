@@ -31,7 +31,7 @@ from functools import wraps
 from typing import Any
 from urllib.parse import quote
 
-from flask import Flask, abort, current_app, g, jsonify, redirect, request
+from flask import Flask, abort, current_app, g, jsonify, redirect, request, session
 
 from cavefinder_auth import (
     AuthConfig,
@@ -85,6 +85,7 @@ def init_auth(app: Flask) -> None:
         except InvalidTokenError as exc:
             log.warning("Rejected invalid JWT on %s: %s", request.path, exc)
             g.user = None
+            return
         except JWKSFetchError as exc:
             # Network blip / IdP momentarily unreachable / cold cache after deploy.
             # Treat as anonymous rather than 500'ing every request from a
@@ -92,6 +93,15 @@ def init_auth(app: Flask) -> None:
             # absorbs longer outages once JWKS has been fetched at least once.
             log.warning("JWKS fetch failed on %s: %s — treating request as anonymous", request.path, exc)
             g.user = None
+            return
+
+        # Phase 1 hybrid bridge: propagate the JWT-resolved user into the
+        # legacy Flask session so existing ``session.get('user_id')`` reads
+        # in retrofitted apps pick up JWT-authenticated users without
+        # touching every call site. Retire this bridge once the legacy
+        # session-based login flow is removed entirely.
+        if g.user and session.get("user_id") != g.user["id"]:
+            session["user_id"] = g.user["id"]
 
 
 def login_required(fn):
