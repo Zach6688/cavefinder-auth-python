@@ -37,6 +37,7 @@ from cavefinder_auth import (
     AuthConfig,
     InvalidTokenError,
     JWKSCache,
+    JWKSFetchError,
     decode_access_token,
     extract_bearer_token,
     verify_m2m_token,
@@ -83,6 +84,13 @@ def init_auth(app: Flask) -> None:
             g.user = decode_access_token(cookie, config=config, jwks_cache=cache)
         except InvalidTokenError as exc:
             log.warning("Rejected invalid JWT on %s: %s", request.path, exc)
+            g.user = None
+        except JWKSFetchError as exc:
+            # Network blip / IdP momentarily unreachable / cold cache after deploy.
+            # Treat as anonymous rather than 500'ing every request from a
+            # cf_at-bearing user. JWKSCache's stale-if-error window (24h)
+            # absorbs longer outages once JWKS has been fetched at least once.
+            log.warning("JWKS fetch failed on %s: %s — treating request as anonymous", request.path, exc)
             g.user = None
 
 
