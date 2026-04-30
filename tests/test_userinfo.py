@@ -264,3 +264,126 @@ async def test_get_user_tier_defaults_to_free_on_missing_field() -> None:
 def test_constructor_rejects_empty_base_url() -> None:
     with pytest.raises(ValueError):
         UserinfoClient(base_url="")
+
+
+# ──────────────────────────────────────────────────────────────
+# SyncUserinfoClient (the Flask-friendly sibling)
+#
+# Same contract as the async class. We don't re-prove every cache-key
+# / single-flight property — those live in shared logic. Pin the
+# Flask-relevant paths: cached fetch, fallback on 5xx, fallback on
+# network error, invalidate, ttl=0, and the convenience helper.
+# ──────────────────────────────────────────────────────────────
+
+from cavefinder_auth import SyncUserinfoClient, get_user_tier_sync  # noqa: E402
+
+
+class _SyncStubClient:
+    """httpx.Client-shape stand-in for sync code paths."""
+
+    def __init__(self, responses):
+        self._responses = responses
+        self.calls: list[dict] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url, headers=None):
+        self.calls.append({"url": url, "headers": headers})
+        if not self._responses:
+            raise RuntimeError("test ran out of canned responses")
+        nxt = self._responses.pop(0)
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
+
+
+def _make_sync_client(responses, *, ttl_seconds: float = 60.0):
+    holders: list[_SyncStubClient] = []
+
+    def factory():
+        c = _SyncStubClient(responses)
+        holders.append(c)
+        return c
+
+    return SyncUserinfoClient(
+        base_url="https://id.cavefinder.app",
+        ttl_seconds=ttl_seconds,
+        client_factory=factory,
+    ), holders
+
+
+def test_sync_fetch_returns_payload_and_caches() -> None:
+    payload = {**_CLAIMS, "tier": "pro", "tier_expires_at": 9_999_999_999.0}
+    client, holders = _make_sync_client([_StubResponse(200, payload)])
+
+    out1 = client.fetch(access_token="t1", claims=_CLAIMS)
+    out2 = client.fetch(access_token="t1", claims=_CLAIMS)
+
+    assert out1 == payload
+    assert out2 == payload
+    assert sum(len(h.calls) for h in holders) == 1
+    h = holders[0].calls[0]["headers"]
+    assert "__Secure-cf_at=t1" in h["Cookie"]
+    assert h["Authorization"] == "Bearer t1"
+    # Different User-Agent so cave-id access logs can distinguish
+    # async vs sync clients in production.
+    assert "userinfo-sync" in h["User-Agent"]
+
+
+def test_sync_fetch_falls_back_on_5xx() -> None:
+    client, _ = _make_sync_client([_StubResponse(500, "boom")])
+    out = client.fetch(access_token="t1", claims=_CLAIMS)
+    assert out["tier"] == "free"  # from claims
+
+
+def test_sync_fetch_falls_back_on_network_error() -> None:
+    import httpx
+    client, _ = _make_sync_client([httpx.ConnectError("dns down")])
+    out = client.fetch(access_token="t1", claims=_CLAIMS)
+    assert out["tier"] == "free"
+
+
+def test_sync_invalidate_drops_user_entries() -> None:
+    payload_free = {**_CLAIMS, "tier": "free", "tier_expires_at": None}
+    payload_pro = {**_CLAIMS, "tier": "pro", "tier_expires_at": None}
+    client, holders = _make_sync_client([
+        _StubResponse(200, payload_free),
+        _StubResponse(200, payload_pro),
+    ])
+
+    client.fetch(access_token="A", claims=_CLAIMS)
+    # Cache hit — no extra HTTP.
+    client.fetch(access_token="A", claims=_CLAIMS)
+    assert sum(len(h.calls) for h in holders) == 1
+
+    client.invalidate(user_id=42)
+    out = client.fetch(access_token="A", claims=_CLAIMS)
+    assert out["tier"] == "pro"
+    assert sum(len(h.calls) for h in holders) == 2
+
+
+def test_sync_ttl_zero_skips_cache() -> None:
+    payload = {**_CLAIMS, "tier": "pro", "tier_expires_at": None}
+    client, holders = _make_sync_client([
+        _StubResponse(200, payload),
+        _StubResponse(200, payload),
+    ])
+    for _ in range(2):
+        client.fetch(access_token="t1", claims=_CLAIMS, ttl_seconds=0)
+    assert sum(len(h.calls) for h in holders) == 2
+
+
+def test_get_user_tier_sync_returns_string() -> None:
+    payload = {**_CLAIMS, "tier": "business", "tier_expires_at": None}
+    client, _ = _make_sync_client([_StubResponse(200, payload)])
+    tier = get_user_tier_sync(client, access_token="t1", claims=_CLAIMS)
+    assert tier == "business"
+
+
+def test_sync_constructor_rejects_empty_base_url() -> None:
+    with pytest.raises(ValueError):
+        SyncUserinfoClient(base_url="")

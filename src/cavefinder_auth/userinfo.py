@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -203,6 +204,136 @@ class UserinfoClient:
                 del self._cache[k]
 
 
+class SyncUserinfoClient:
+    """Synchronous sibling of :class:`UserinfoClient` for Flask apps.
+
+    Cavefinder is sync Flask; awaiting the async client from a sync
+    request handler means spinning a fresh event loop per call (slow,
+    error-prone, and breaks request-context propagation). This class is
+    the same TTL-cache + fail-soft semantics, but built on
+    ``httpx.Client`` and ``threading.Lock`` so it integrates cleanly
+    with Flask's threaded request handling.
+
+    The cache shape and ``invalidate(user_id)`` semantics are identical
+    to the async class — both ship in v0.2.0 so each downstream picks
+    the one that matches its concurrency model. georef and surveylens
+    are FastAPI/async; cavefinder is the sync consumer.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        ttl_seconds: float = DEFAULT_TTL_SECONDS,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        client_factory=None,
+        cookie_name: str = "__Secure-cf_at",
+    ) -> None:
+        if not base_url:
+            raise ValueError("SyncUserinfoClient requires a non-empty base_url")
+        self._base_url = base_url.rstrip("/")
+        self._ttl = float(ttl_seconds)
+        self._timeout = float(timeout_seconds)
+        self._client_factory = client_factory or (
+            lambda: httpx.Client(timeout=timeout_seconds)
+        )
+        self._cookie_name = cookie_name
+        self._cache: dict[str, _CacheEntry] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _token_prefix(access_token: str) -> str:
+        return hashlib.sha256(access_token.encode("ascii", "ignore")).hexdigest()[:16]
+
+    def _cache_key(self, user_id: int, access_token: str) -> str:
+        return f"{user_id}:{self._token_prefix(access_token)}"
+
+    def _claims_fallback(self, claims: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": int(claims.get("sub") or claims.get("user_id") or 0),
+            "email": claims.get("email"),
+            "display_name": claims.get("display_name"),
+            "tier": claims.get("tier") or "free",
+            "tier_expires_at": None,
+            "email_verified": claims.get("email_verified", False),
+            "is_admin": claims.get("is_admin", False),
+            "impersonator_id": claims.get("imp"),
+        }
+
+    def fetch(
+        self,
+        *,
+        access_token: str,
+        claims: dict[str, Any],
+        ttl_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        ttl = self._ttl if ttl_seconds is None else float(ttl_seconds)
+        try:
+            user_id = int(claims["sub"])
+        except (KeyError, TypeError, ValueError):
+            return self._claims_fallback(claims)
+        key = self._cache_key(user_id, access_token)
+
+        now = time.time()
+        if ttl > 0:
+            entry = self._cache.get(key)
+            if entry is not None and entry.expires_at > now:
+                return entry.payload
+
+        # Lock-then-recheck single-flight, sync flavor. Without this,
+        # a thundering herd of Flask threads on a cold cache all do
+        # their own httpx GET. With it, only one fires and the rest
+        # block on the lock then read the cache hit.
+        with self._lock:
+            if ttl > 0:
+                entry = self._cache.get(key)
+                if entry is not None and entry.expires_at > now:
+                    return entry.payload
+
+            payload = self._http_fetch(access_token=access_token)
+            if payload is None:
+                return self._claims_fallback(claims)
+            self._cache[key] = _CacheEntry(
+                expires_at=time.time() + ttl, payload=payload,
+            )
+            return payload
+
+    def _http_fetch(self, *, access_token: str) -> dict[str, Any] | None:
+        url = f"{self._base_url}/api/userinfo"
+        headers = {
+            "Cookie": f"{self._cookie_name}={access_token}",
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": "cavefinder-auth-python/userinfo-sync",
+        }
+        try:
+            with self._client_factory() as client:
+                resp = client.get(url, headers=headers)
+        except httpx.HTTPError as exc:
+            log.warning(
+                "userinfo.http_error",
+                extra={"error_class": type(exc).__name__, "error": str(exc)},
+            )
+            return None
+        if resp.status_code != 200:
+            log.warning(
+                "userinfo.non_200",
+                extra={"status": resp.status_code, "body": resp.text[:200]},
+            )
+            return None
+        try:
+            return resp.json()
+        except ValueError as exc:
+            log.warning("userinfo.invalid_json", extra={"error": str(exc)})
+            return None
+
+    def invalidate(self, user_id: int) -> None:
+        prefix = f"{user_id}:"
+        with self._lock:
+            for k in list(self._cache.keys()):
+                if k.startswith(prefix):
+                    del self._cache[k]
+
+
 async def get_user_tier(
     client: UserinfoClient,
     *,
@@ -216,4 +347,16 @@ async def get_user_tier(
     userinfo dict should use ``client.fetch(...)`` directly.
     """
     payload = await client.fetch(access_token=access_token, claims=claims)
+    return payload.get("tier") or "free"
+
+
+def get_user_tier_sync(
+    client: SyncUserinfoClient,
+    *,
+    access_token: str,
+    claims: dict[str, Any],
+) -> str:
+    """Sync flavor of :func:`get_user_tier` for Flask. Same defaults +
+    fall-through semantics."""
+    payload = client.fetch(access_token=access_token, claims=claims)
     return payload.get("tier") or "free"
