@@ -17,8 +17,9 @@ from .jwks import JWKSCache
 from .m2m import extract_bearer_token, hash_token, require_m2m_token, verify_m2m_token
 from .middleware import AuthMiddleware, optional_user, require_user
 from .tokens import decode_access_token
+from .userinfo import UserinfoClient, get_user_tier
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",
@@ -30,6 +31,9 @@ __all__ = [
     # Token/JWKS primitives (advanced use)
     "decode_access_token",
     "JWKSCache",
+    # Live userinfo client (Phase 1 — sole tier source-of-truth)
+    "UserinfoClient",
+    "get_user_tier",
     # M2M helpers
     "require_m2m_token",
     "verify_m2m_token",
