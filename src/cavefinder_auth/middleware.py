@@ -4,37 +4,19 @@ DESIGN.md §6.1:
     Each client app adds a middleware that:
       1. Read __Secure-cf_at cookie.
       2. Verify per §5.5.
-      3. On success → populate request.state.user (for HTTP) or scope["user"]
-         (for WebSocket).
+      3. On success → populate request.state.user.
       4. On missing cookie:
            - JSON routes → 401 JSON body.
            - HTML page routes → 302 to https://id.cavefinder.app/login?return=<url>.
-           - WebSocket → close with code 4401 (custom per RFC 6455) before the
-             handshake completes.
-      5. On invalid signature → 401 for HTTP, 4401 close for WebSocket.
-         (Prevents redirect loops from tampered cookies; prevents an attacker
-         from holding a socket open with a bad token.)
+      5. On invalid signature → 401 always (prevents redirect loops from tampered cookies).
 
-How we decide JSON vs HTML (HTTP only):
+How we decide JSON vs HTML:
     * Any path beginning with ``/api/`` (the project's FastAPI convention) → JSON.
     * Else, look at ``Accept`` header — ``application/json`` / ``text/event-stream``
       get JSON; anything else (including ``text/html``, ``*/*``, missing) gets HTML.
 
-WebSocket auth (OBS-2 closure):
-    The middleware now intercepts `scope["type"] == "websocket"` too. Cookie
-    extraction + verification reuse the HTTP path; on success we stash the
-    user dict on scope["user"] AND on the Request-like wrapper so endpoints
-    can read `websocket.scope["user"]` or `websocket.state.user` (Starlette
-    WebSocket exposes both). On failure we emit a websocket.close ASGI
-    message with code 4401 — this rejects the handshake cleanly and the
-    browser Client sees a WebSocket `close` event with that code, which
-    downstream client code can distinguish from a generic 1006.
-
 Public paths (config.public_paths) bypass auth entirely — use for health checks,
-static assets, public viewer routes (e.g. georef's ``/view/:id``), and any
-WebSocket paths that are legitimately public (e.g. real-time map tile
-streams). Whitelisting a WebSocket path is an explicit security decision:
-the middleware won't guess.
+static assets, and public viewer routes (e.g. georef's ``/view/:id``).
 """
 from __future__ import annotations
 
@@ -43,12 +25,12 @@ from urllib.parse import quote
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
-from starlette.types import ASGIApp, Message, Receive, Scope, Send
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .config import AuthConfig
 from .errors import InvalidTokenError
 from .jwks import JWKSCache
-from .tokens import decode_access_token
+from .tokens import decode_access_token_async
 
 log = logging.getLogger(__name__)
 
@@ -84,20 +66,10 @@ class AuthMiddleware:
         )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        scope_type = scope.get("type")
-        if scope_type == "http":
-            await self._handle_http(scope, receive, send)
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
             return
-        if scope_type == "websocket":
-            await self._handle_websocket(scope, receive, send)
-            return
-        # Lifespan (startup/shutdown) and anything exotic pass through — they
-        # don't carry user identity.
-        await self.app(scope, receive, send)
 
-    async def _handle_http(
-        self, scope: Scope, receive: Receive, send: Send,
-    ) -> None:
         request = Request(scope, receive=receive)
 
         # Public paths (health, static, viewer) bypass auth entirely.
@@ -112,7 +84,9 @@ class AuthMiddleware:
             return
 
         try:
-            user = decode_access_token(cookie, config=self.config, jwks_cache=self.jwks_cache)
+            user = await decode_access_token_async(
+                cookie, config=self.config, jwks_cache=self.jwks_cache
+            )
         except InvalidTokenError as exc:
             log.warning(
                 "Rejected invalid JWT for %s %s: %s",
@@ -128,54 +102,6 @@ class AuthMiddleware:
         # Starlette's Request.state is backed by scope["state"] (a State object),
         # so setting it here persists for the duration of the request.
         request.state.user = user
-
-        await self.app(scope, receive, send)
-
-    async def _handle_websocket(
-        self, scope: Scope, receive: Receive, send: Send,
-    ) -> None:
-        """Enforce the same cookie auth on WebSocket handshakes.
-
-        Public WebSocket paths (via config.public_paths) bypass auth — this
-        covers future "public map tile stream" style routes.
-
-        On missing or invalid cookie we send a `websocket.close` ASGI message
-        with code 4401 BEFORE the handshake completes. Per ASGI spec, the
-        client sees the close cleanly and no `websocket.connect` is ever
-        delivered to the app — the route handler isn't reachable.
-        """
-        path = scope.get("path", "")
-        if self.config.is_public_path(path):
-            await self.app(scope, receive, send)
-            return
-
-        cookie = _cookie_from_scope(scope, self.config.cookie_name)
-        if not cookie:
-            log.info("Rejecting websocket connect for %s: no cookie", path)
-            await _ws_close_with_code(send, code=4401)
-            return
-
-        try:
-            user = decode_access_token(
-                cookie, config=self.config, jwks_cache=self.jwks_cache,
-            )
-        except InvalidTokenError as exc:
-            log.warning("Rejected invalid JWT for ws %s: %s", path, exc)
-            await _ws_close_with_code(send, code=4401)
-            return
-
-        # Expose the user to the route handler via both conventions so
-        # endpoints can read from whichever they prefer:
-        #   async def ws(websocket: WebSocket):
-        #       user = websocket.scope["user"]
-        #       # or
-        #       user = websocket.state.user
-        scope["user"] = user
-        state = scope.setdefault("state", {})
-        # Starlette's State wraps a dict; for scope-level injection the
-        # plain dict works because State(scope["state"]) just reads/writes it.
-        if isinstance(state, dict):
-            state["user"] = user
 
         await self.app(scope, receive, send)
 
@@ -212,45 +138,6 @@ class AuthMiddleware:
         if request.headers.get("x-requested-with", "").lower() == "fetch":
             return True
         return False
-
-
-def _cookie_from_scope(scope: Scope, cookie_name: str) -> str | None:
-    """Extract a single cookie from a raw ASGI scope without building a Request.
-
-    WebSocket scopes don't expose a `.cookies` dict directly; we walk the raw
-    headers and parse the `cookie` header ourselves. Parsing is deliberately
-    minimal (split on `;`, trim, split on first `=`) — the http.cookies
-    module would be stricter but adds a dep and handles quoted values we
-    don't emit.
-    """
-    raw_headers = scope.get("headers") or ()
-    for raw_name, raw_value in raw_headers:
-        if raw_name == b"cookie":
-            try:
-                header = raw_value.decode("latin-1")
-            except UnicodeDecodeError:
-                return None
-            for piece in header.split(";"):
-                piece = piece.strip()
-                if not piece or "=" not in piece:
-                    continue
-                name, _, value = piece.partition("=")
-                if name.strip() == cookie_name:
-                    return value.strip()
-    return None
-
-
-async def _ws_close_with_code(send: Send, *, code: int) -> None:
-    """Close a WebSocket before the handshake completes with a custom code.
-
-    Per ASGI, emitting `websocket.close` before `websocket.accept` rejects
-    the handshake — the HTTP response becomes 403 from the server's POV and
-    the browser `WebSocket` constructor fires a `close` event with the code
-    we pass. 4401 is the standard convention for "unauthorized" in the
-    private-use close-code range (4000–4999 per RFC 6455 §7.4.2).
-    """
-    message: Message = {"type": "websocket.close", "code": code}
-    await send(message)
 
 
 # Convenience FastAPI dependency for routes that need the current user.

@@ -9,13 +9,30 @@ The cache is an in-memory dict keyed by JWKS URL, so a single process shares one
 copy across all requests. Thread-safe via a single ``threading.Lock`` — fine for
 the typical uvicorn worker model (one event loop per process; lock contention is
 negligible since we only touch it on JWKS refresh).
+
+Two robustness invariants beyond the basic cache:
+
+* **Bounded LRU.** The cache is capped at ``max_urls`` entries (default 8 —
+  more than enough for a single client app that only ever points at one IdP,
+  plus some headroom for tests that exercise multiple URLs). If ``jwks_url``
+  is ever derived from request input via a refactor mistake the cache cannot
+  grow without bound. On overflow the least-recently-used entry is evicted.
+
+* **Coalesced concurrent fetches.** During a cold start or right after a TTL
+  expiry, N simultaneous requests would all trigger N independent httpx
+  GETs. The cache tracks per-URL "fetch in flight" state (``threading.Event``
+  for the sync path, ``asyncio.Future`` for the async path); callers that
+  arrive while a fetch is already running wait on it instead of duplicating
+  work.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,19 +52,7 @@ class _CacheEntry:
 
 
 class JWKSCache:
-    """Fetches + caches JWKS per URL. Reusable across AuthConfig instances.
-
-    ``unknown_kid_ttl`` (default 10 s) is the negative-cache window. When a
-    token arrives with a kid we didn't find after a forced refresh, we
-    remember that "kid X wasn't here at time T" and reject subsequent
-    tokens with the same kid for ``unknown_kid_ttl`` seconds without
-    hitting the JWKS endpoint again. Closes the amplification vector
-    documented in docs/AUTH_PACKAGE_REVIEW.md (OBS-1): without this, an
-    attacker blasting random kids can turn every failed verification into
-    a JWKS HTTP round-trip. 10 s is short enough that a real rotation
-    lands quickly (and the refresh-on-unknown-kid path still runs on the
-    first instance) and long enough to neutralize a tight loop.
-    """
+    """Fetches + caches JWKS per URL. Reusable across AuthConfig instances."""
 
     def __init__(
         self,
@@ -55,21 +60,25 @@ class JWKSCache:
         cache_ttl: int = 3600,
         stale_ttl: int = 86400,
         http_timeout: float = 5.0,
-        unknown_kid_ttl: float = 10.0,
+        max_urls: int = 8,
     ) -> None:
         self.cache_ttl = cache_ttl
         self.stale_ttl = stale_ttl
         self.http_timeout = http_timeout
-        self.unknown_kid_ttl = unknown_kid_ttl
-        self._entries: dict[str, _CacheEntry] = {}
+        if max_urls < 1:
+            raise ValueError("max_urls must be >= 1")
+        self.max_urls = max_urls
+        # OrderedDict so we can do O(1) LRU eviction via move_to_end / popitem(last=False).
+        self._entries: OrderedDict[str, _CacheEntry] = OrderedDict()
         self._lock = threading.Lock()
         # Overridable for tests — see testing.override_jwks().
         self._overrides: dict[str, dict[str, RSAPublicKey]] = {}
-        # Negative cache: (jwks_url → {kid → timestamp}) for kids we
-        # looked up, did a forced refresh for, and still didn't find.
-        # Scoped per-URL because a kid absent from one IdP might be
-        # present at another.
-        self._unknown_kids: dict[str, dict[str, float]] = {}
+        # Coalescing state. The sync map's value is set when a fetch starts and
+        # cleared when it ends; concurrent callers wait on the event. Async map
+        # holds a future per URL; concurrent callers ``await`` the same future.
+        # Both maps are mutated under self._lock.
+        self._inflight_sync: dict[str, threading.Event] = {}
+        self._inflight_async: dict[str, asyncio.Future[dict[str, RSAPublicKey]]] = {}
 
     # ──────────────────────────────────────────────────────────────
     # Test overrides
@@ -82,6 +91,22 @@ class JWKSCache:
     def clear_override(self, jwks_url: str) -> None:
         with self._lock:
             self._overrides.pop(jwks_url, None)
+
+    # ──────────────────────────────────────────────────────────────
+    # Internal cache bookkeeping
+    # ──────────────────────────────────────────────────────────────
+    def _store_entry(self, jwks_url: str, entry: _CacheEntry) -> None:
+        """Insert/refresh an entry and enforce the LRU cap. Caller holds _lock."""
+        self._entries[jwks_url] = entry
+        self._entries.move_to_end(jwks_url)
+        while len(self._entries) > self.max_urls:
+            evicted_url, _ = self._entries.popitem(last=False)
+            log.debug("JWKS cache evicted LRU entry: %s", evicted_url)
+
+    def _touch_entry(self, jwks_url: str) -> None:
+        """Mark this entry as most-recently-used. Caller holds _lock."""
+        if jwks_url in self._entries:
+            self._entries.move_to_end(jwks_url)
 
     # ──────────────────────────────────────────────────────────────
     # Public API
@@ -99,37 +124,27 @@ class JWKSCache:
         If the key is still missing after a fresh fetch, raise JWKSFetchError —
         the caller treats that as an invalid token (wrong kid).
         """
-        override = self._overrides.get(jwks_url)
+        with self._lock:
+            override = self._overrides.get(jwks_url)
         if override is not None:
             if kid in override:
                 return override[kid]
             raise JWKSFetchError(f"kid {kid!r} not in JWKS override for {jwks_url}")
 
         now = time.time()
-
-        # Negative cache — short-circuit before we touch the network.
-        # A kid we just learned is absent stays absent for unknown_kid_ttl
-        # seconds; repeated lookups can't amplify into JWKS traffic.
-        neg = self._unknown_kids.get(jwks_url, {})
-        neg_ts = neg.get(kid)
-        if neg_ts is not None and (now - neg_ts) <= self.unknown_kid_ttl:
-            raise JWKSFetchError(
-                f"kid {kid!r} not found in JWKS at {jwks_url} "
-                f"(negative-cached for {self.unknown_kid_ttl}s)"
-            )
-
-        entry = self._entries.get(jwks_url)
+        with self._lock:
+            entry = self._entries.get(jwks_url)
+            if entry is not None:
+                self._touch_entry(jwks_url)
 
         need_fetch = entry is None or (now - entry.fetched_at) > self.cache_ttl
 
         if need_fetch:
             try:
-                fetched = self._fetch(jwks_url)
+                fetched = self._fetch_coalesced(jwks_url)
                 with self._lock:
-                    self._entries[jwks_url] = _CacheEntry(
-                        keys_by_kid=fetched, fetched_at=now
-                    )
-                entry = self._entries[jwks_url]
+                    self._store_entry(jwks_url, _CacheEntry(keys_by_kid=fetched, fetched_at=now))
+                    entry = self._entries[jwks_url]
             except Exception as exc:
                 if entry is not None and (now - entry.fetched_at) <= self.stale_ttl:
                     log.warning(
@@ -149,22 +164,155 @@ class JWKSCache:
             # causing cached clients to 401 for up to an hour.
             if not need_fetch:
                 try:
-                    fetched = self._fetch(jwks_url)
+                    fetched = self._fetch_coalesced(jwks_url)
                     with self._lock:
-                        self._entries[jwks_url] = _CacheEntry(
-                            keys_by_kid=fetched, fetched_at=now
-                        )
+                        self._store_entry(jwks_url, _CacheEntry(keys_by_kid=fetched, fetched_at=now))
                     key = fetched.get(kid)
                 except Exception as exc:
                     log.warning("JWKS refresh-on-unknown-kid failed for %s: %s", jwks_url, exc)
             if key is None:
-                # Still absent after a forced refresh — remember so the
-                # next hit with the same kid doesn't trigger another
-                # fetch. See OBS-1 note at the class docstring.
-                with self._lock:
-                    self._unknown_kids.setdefault(jwks_url, {})[kid] = now
                 raise JWKSFetchError(f"kid {kid!r} not found in JWKS at {jwks_url}")
         return key
+
+    async def get_key_async(self, jwks_url: str, kid: str) -> RSAPublicKey:
+        """Async mirror of :meth:`get_key` — non-blocking JWKS fetch.
+
+        Use this from ASGI middleware / async request handlers. The sync
+        :meth:`get_key` blocks the event loop for up to ``http_timeout`` seconds
+        on JWKS server slowness; this version awaits an ``httpx.AsyncClient``
+        fetch instead. Cache semantics and override behavior are identical.
+        """
+        with self._lock:
+            override = self._overrides.get(jwks_url)
+        if override is not None:
+            if kid in override:
+                return override[kid]
+            raise JWKSFetchError(f"kid {kid!r} not in JWKS override for {jwks_url}")
+
+        now = time.time()
+        with self._lock:
+            entry = self._entries.get(jwks_url)
+            if entry is not None:
+                self._touch_entry(jwks_url)
+
+        need_fetch = entry is None or (now - entry.fetched_at) > self.cache_ttl
+
+        if need_fetch:
+            try:
+                fetched = await self._fetch_coalesced_async(jwks_url)
+                with self._lock:
+                    self._store_entry(jwks_url, _CacheEntry(keys_by_kid=fetched, fetched_at=now))
+                    entry = self._entries[jwks_url]
+            except Exception as exc:
+                if entry is not None and (now - entry.fetched_at) <= self.stale_ttl:
+                    log.warning(
+                        "JWKS fetch failed for %s — serving stale cache (%.0fs old): %s",
+                        jwks_url,
+                        now - entry.fetched_at,
+                        exc,
+                    )
+                else:
+                    raise JWKSFetchError(f"JWKS fetch failed for {jwks_url}: {exc}") from exc
+
+        assert entry is not None  # for type narrowing; the branches above guarantee it
+        key = entry.keys_by_kid.get(kid)
+        if key is None:
+            # Unknown kid — it might be a new key we haven't picked up yet. Force a
+            # refresh once before giving up. This prevents a new-key rotation from
+            # causing cached clients to 401 for up to an hour.
+            if not need_fetch:
+                try:
+                    fetched = await self._fetch_coalesced_async(jwks_url)
+                    with self._lock:
+                        self._store_entry(jwks_url, _CacheEntry(keys_by_kid=fetched, fetched_at=now))
+                    key = fetched.get(kid)
+                except Exception as exc:
+                    log.warning("JWKS refresh-on-unknown-kid failed for %s: %s", jwks_url, exc)
+            if key is None:
+                raise JWKSFetchError(f"kid {kid!r} not found in JWKS at {jwks_url}")
+        return key
+
+    # ──────────────────────────────────────────────────────────────
+    # Coalesced fetch helpers
+    # ──────────────────────────────────────────────────────────────
+    def _fetch_coalesced(self, jwks_url: str) -> dict[str, RSAPublicKey]:
+        """Sync coalesced fetch — N concurrent callers do exactly one HTTP GET.
+
+        First caller installs a ``threading.Event``, performs the fetch, then
+        sets the event. Concurrent callers see the event in the in-flight map
+        and wait on it. After the leader returns, all followers re-read the
+        cache (which the leader just populated) and use that value. On failure
+        the leader re-raises; followers raise a generic JWKSFetchError after
+        the wait so they don't all log identical stack traces.
+        """
+        with self._lock:
+            existing = self._inflight_sync.get(jwks_url)
+            if existing is None:
+                event = threading.Event()
+                self._inflight_sync[jwks_url] = event
+                is_leader = True
+            else:
+                event = existing
+                is_leader = False
+
+        if not is_leader:
+            # Wait for the leader. Bounded by http_timeout + a small slack so a
+            # wedged leader can't pin followers forever.
+            event.wait(timeout=self.http_timeout + 1.0)
+            with self._lock:
+                entry = self._entries.get(jwks_url)
+            if entry is None:
+                raise JWKSFetchError(f"JWKS fetch coalesced wait did not yield cached entry for {jwks_url}")
+            return dict(entry.keys_by_kid)
+
+        try:
+            return self._fetch(jwks_url)
+        finally:
+            with self._lock:
+                # Only pop if we're still the registered leader (defensive — should always be).
+                if self._inflight_sync.get(jwks_url) is event:
+                    self._inflight_sync.pop(jwks_url, None)
+            event.set()
+
+    async def _fetch_coalesced_async(self, jwks_url: str) -> dict[str, RSAPublicKey]:
+        """Async coalesced fetch — concurrent awaiters share one httpx GET.
+
+        First awaiter creates a ``Future`` and registers it in the in-flight
+        map, runs the HTTP fetch, then sets the future's result or exception.
+        Subsequent awaiters return ``asyncio.shield(future)`` so a follower
+        cancellation does not propagate into the leader's fetch.
+        """
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            existing = self._inflight_async.get(jwks_url)
+            if existing is None:
+                future: asyncio.Future[dict[str, RSAPublicKey]] = loop.create_future()
+                self._inflight_async[jwks_url] = future
+                is_leader = True
+            else:
+                future = existing
+                is_leader = False
+
+        if not is_leader:
+            # Shield so a follower being cancelled doesn't cancel the leader's fetch.
+            return await asyncio.shield(future)
+
+        try:
+            result = await self._fetch_async(jwks_url)
+        except BaseException as exc:
+            with self._lock:
+                if self._inflight_async.get(jwks_url) is future:
+                    self._inflight_async.pop(jwks_url, None)
+            if not future.done():
+                future.set_exception(exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+            raise
+        else:
+            with self._lock:
+                if self._inflight_async.get(jwks_url) is future:
+                    self._inflight_async.pop(jwks_url, None)
+            if not future.done():
+                future.set_result(result)
+            return result
 
     # ──────────────────────────────────────────────────────────────
     # Internals
@@ -172,6 +320,13 @@ class JWKSCache:
     def _fetch(self, jwks_url: str) -> dict[str, RSAPublicKey]:
         with httpx.Client(timeout=self.http_timeout) as client:
             resp = client.get(jwks_url)
+            resp.raise_for_status()
+            payload = resp.json()
+        return _parse_jwks(payload)
+
+    async def _fetch_async(self, jwks_url: str) -> dict[str, RSAPublicKey]:
+        async with httpx.AsyncClient(timeout=self.http_timeout) as client:
+            resp = await client.get(jwks_url)
             resp.raise_for_status()
             payload = resp.json()
         return _parse_jwks(payload)

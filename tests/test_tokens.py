@@ -143,3 +143,91 @@ def test_decode_rejects_missing_kid(keypair, cache_with_key, cfg):
     )
     with pytest.raises(InvalidTokenError):
         decode_access_token(token, config=cfg, jwks_cache=cache_with_key)
+
+
+def test_decode_rejects_missing_exp(keypair, cache_with_key, cfg):
+    """§5.5 hardening — PyJWT does NOT enforce exp/iat presence by default.
+
+    Without ``options={"require": [...]}`` a token with ``iss`` + ``sub`` only
+    (no ``exp``) would decode and validate forever. We pin the contract that
+    such a token is rejected.
+    """
+    import jwt as pyjwt
+    from cryptography.hazmat.primitives import serialization
+
+    private_pem = keypair.private.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    # iss + sub only, no exp / no iat
+    token = pyjwt.encode(
+        {"iss": DEFAULT_TEST_ISSUER, "sub": "1"},
+        private_pem,
+        algorithm="RS256",
+        headers={"kid": keypair.kid},
+    )
+    with pytest.raises(InvalidTokenError) as exc_info:
+        decode_access_token(token, config=cfg, jwks_cache=cache_with_key)
+    # PyJWT raises MissingRequiredClaimError, message includes the claim name.
+    assert "exp" in str(exc_info.value).lower() or "required" in str(exc_info.value).lower()
+
+
+def test_decode_rejects_missing_iat(keypair, cache_with_key, cfg):
+    """Same hardening applied to ``iat``."""
+    import jwt as pyjwt
+    from cryptography.hazmat.primitives import serialization
+
+    private_pem = keypair.private.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    token = pyjwt.encode(
+        {"iss": DEFAULT_TEST_ISSUER, "sub": "1", "exp": int(time.time()) + 60},
+        private_pem,
+        algorithm="RS256",
+        headers={"kid": keypair.kid},
+    )
+    with pytest.raises(InvalidTokenError):
+        decode_access_token(token, config=cfg, jwks_cache=cache_with_key)
+
+
+def test_decode_with_aud_present_but_no_config_audience(keypair, cache_with_key, cfg):
+    """When ``AuthConfig.audience`` is None (current default), a token whose
+    ``aud`` claim is set to anything (e.g. a surveylens-targeted token) still
+    decodes successfully. The audience check is opt-in — consumers must set
+    ``audience=`` explicitly to pin it. This test documents that contract so
+    a future change that flips the default doesn't quietly break existing
+    callers.
+    """
+    assert cfg.audience is None
+    token = make_test_jwt(
+        keypair,
+        extra_claims={"aud": "surveylens"},
+    )
+    user = decode_access_token(token, config=cfg, jwks_cache=cache_with_key)
+    # Decoded successfully — the aud claim is ignored when no audience is configured.
+    assert user["id"] == 1
+
+
+def test_decode_with_aud_matches_configured_audience(keypair, cache_with_key):
+    """When ``AuthConfig.audience`` IS set, PyJWT verifies aud matches."""
+    cfg = AuthConfig(
+        issuer=DEFAULT_TEST_ISSUER,
+        jwks_url="https://id.cavefinder.app/.well-known/jwks.json",
+        login_url="https://id.cavefinder.app/login",
+        audience="georef",
+    )
+    good = make_test_jwt(keypair, extra_claims={"aud": "georef"})
+    user = decode_access_token(good, config=cfg, jwks_cache=cache_with_key)
+    assert user["id"] == 1
+
+    bad = make_test_jwt(keypair, extra_claims={"aud": "surveylens"})
+    with pytest.raises(InvalidTokenError):
+        decode_access_token(bad, config=cfg, jwks_cache=cache_with_key)
+
+    # Missing aud when one is required also fails.
+    missing = make_test_jwt(keypair)  # no aud claim
+    with pytest.raises(InvalidTokenError):
+        decode_access_token(missing, config=cfg, jwks_cache=cache_with_key)

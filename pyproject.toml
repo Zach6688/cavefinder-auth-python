@@ -4,17 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cavefinder-auth"
-version = "0.2.0"
+version = "0.2.1"
 description = "Shared JWT verification + FastAPI middleware for CaveFinder Identity Provider client apps (georef, surveylens, cavefinder)."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "UNLICENSED" }
 authors = [{ name = "CaveFinder", email = "team@cavefinder.app" }]
 dependencies = [
-  "pyjwt[crypto]>=2.8",
-  "cryptography>=41",
-  "httpx>=0.25",
-  "starlette>=0.36",
+  "pyjwt[crypto]>=2.10.1",
+  "cryptography>=44",
+  "httpx>=0.28",
+  "starlette>=0.49",
 ]
 
 [project.optional-dependencies]

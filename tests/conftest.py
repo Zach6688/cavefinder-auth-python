@@ -6,7 +6,7 @@ build a tiny throw-away FastAPI app per test and mount the middleware on it.
 from __future__ import annotations
 
 import pytest
-from fastapi import FastAPI, Request, WebSocket
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 
 from cavefinder_auth import AuthConfig, AuthMiddleware
@@ -24,8 +24,7 @@ def config():
         issuer=DEFAULT_TEST_ISSUER,
         jwks_url="https://id.cavefinder.app/.well-known/jwks.json",
         login_url="https://id.cavefinder.app/login",
-        # /ws/public exercises the public-path bypass for websockets.
-        public_paths=("/api/healthz", "/static", "/view", "/ws/public"),
+        public_paths=("/api/healthz", "/static", "/view"),
     )
 
 
@@ -59,21 +58,5 @@ def app(config):
     @app.get("/view/{project_id}", response_class=HTMLResponse)
     def viewer(project_id: str):
         return f"<h1>Public view {project_id}</h1>"
-
-    # WebSocket routes for OBS-2 coverage. /ws/private is auth-required;
-    # /ws/public is whitelisted via public_paths. Both just echo the user
-    # dict (or "anonymous") so tests can assert on what reached the handler.
-    @app.websocket("/ws/private")
-    async def ws_private(websocket: WebSocket):
-        user = websocket.scope.get("user")
-        await websocket.accept()
-        await websocket.send_json({"user": user})
-        await websocket.close()
-
-    @app.websocket("/ws/public")
-    async def ws_public(websocket: WebSocket):
-        await websocket.accept()
-        await websocket.send_json({"user": websocket.scope.get("user")})
-        await websocket.close()
 
     return app

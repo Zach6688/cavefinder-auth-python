@@ -17,12 +17,32 @@ from .config import AuthConfig
 from .errors import InvalidTokenError
 from .jwks import JWKSCache
 
+# §5.5 — PyJWT does NOT enforce presence of these claims by default. If a token
+# arrives without ``exp`` PyJWT happily decodes it and never enforces an
+# expiration. Same for ``iat`` and ``iss``. We require them explicitly so a
+# malformed or maliciously-minted token can't dodge the safety net.
+_REQUIRED_CLAIMS = ["exp", "iat", "iss", "sub"]
+
 
 def _public_key_pem(public_key: RSAPublicKey) -> bytes:
     return public_key.public_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
+
+
+def _decode_options(audience: str | None) -> dict[str, object]:
+    """Build the ``options`` kwarg for :func:`jwt.decode`.
+
+    Always requires exp/iat/iss/sub. When ``audience`` is ``None`` the ``aud``
+    claim is not verified (current IdP behavior — no ``aud`` is emitted yet).
+    When ``audience`` is set, PyJWT's default ``verify_aud=True`` kicks in via
+    the ``audience=`` kwarg passed to :func:`jwt.decode`.
+    """
+    options: dict[str, object] = {"require": list(_REQUIRED_CLAIMS)}
+    if audience is None:
+        options["verify_aud"] = False
+    return options
 
 
 def decode_access_token(
@@ -62,6 +82,54 @@ def decode_access_token(
             algorithms=["RS256"],           # §5.5 explicit
             issuer=config.issuer,            # §5.5 issuer check
             leeway=config.jwt_leeway,        # §5.5 leeway
+            audience=config.audience,        # None → skipped via options below
+            options=_decode_options(config.audience),
+        )
+    except jwt.PyJWTError as exc:
+        raise InvalidTokenError(str(exc)) from exc
+
+    return claims_to_user(claims)
+
+
+async def decode_access_token_async(
+    token: str,
+    *,
+    config: AuthConfig,
+    jwks_cache: JWKSCache,
+) -> dict[str, Any]:
+    """Async mirror of :func:`decode_access_token` — non-blocking JWKS lookup.
+
+    Use this from ASGI middleware so a slow JWKS server can't stall the event
+    loop for every concurrent request. Verification rules are identical.
+    """
+    if not token:
+        raise InvalidTokenError("empty token")
+
+    try:
+        unverified_header = jwt.get_unverified_header(token)
+    except jwt.PyJWTError as exc:
+        raise InvalidTokenError(f"malformed JWT header: {exc}") from exc
+
+    kid = unverified_header.get("kid")
+    if not kid:
+        raise InvalidTokenError("JWT header missing 'kid'")
+
+    try:
+        public_key = await jwks_cache.get_key_async(config.jwks_url, kid)
+    except Exception as exc:
+        # Treat any JWKS-lookup failure as token-invalid, not JWKS-down, so the
+        # middleware returns 401 rather than 500. JWKSFetchError is already logged.
+        raise InvalidTokenError(f"JWKS lookup failed: {exc}") from exc
+
+    try:
+        claims = jwt.decode(
+            token,
+            _public_key_pem(public_key),
+            algorithms=["RS256"],           # §5.5 explicit
+            issuer=config.issuer,            # §5.5 issuer check
+            leeway=config.jwt_leeway,        # §5.5 leeway
+            audience=config.audience,        # None → skipped via options below
+            options=_decode_options(config.audience),
         )
     except jwt.PyJWTError as exc:
         raise InvalidTokenError(str(exc)) from exc

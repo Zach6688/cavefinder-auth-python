@@ -50,6 +50,15 @@ class AuthConfig:
     ``http_timeout``
         Timeout for the JWKS fetch. Kept deliberately short — stale cache is
         better than a 30 s hang on every incoming request.
+
+    ``audience``
+        Optional. When set, the JWT ``aud`` claim is verified to equal this
+        value. Today the IdP does not emit ``aud``, so all consumers leave
+        this ``None`` and the audience check is skipped. Once the IdP starts
+        emitting per-client audiences (e.g. ``georef`` vs ``surveylens`` vs
+        ``cavefinder``) each consumer can pin its own ``aud`` here as
+        defense-in-depth against a token minted for a different client app
+        being accepted.
     """
 
     issuer: str
@@ -61,6 +70,7 @@ class AuthConfig:
     jwks_stale_ttl: int = DEFAULT_JWKS_STALE_TTL
     jwt_leeway: int = DEFAULT_JWT_LEEWAY
     http_timeout: float = DEFAULT_HTTP_TIMEOUT
+    audience: str | None = None
 
     def is_public_path(self, path: str) -> bool:
         """True if the request path should skip auth entirely."""
