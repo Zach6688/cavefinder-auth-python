@@ -10,7 +10,7 @@ copy across all requests. Thread-safe via a single ``threading.Lock`` — fine f
 the typical uvicorn worker model (one event loop per process; lock contention is
 negligible since we only touch it on JWKS refresh).
 
-Two robustness invariants beyond the basic cache:
+Three robustness invariants beyond the basic cache:
 
 * **Bounded LRU.** The cache is capped at ``max_urls`` entries (default 8 —
   more than enough for a single client app that only ever points at one IdP,
@@ -24,6 +24,19 @@ Two robustness invariants beyond the basic cache:
   for the sync path, ``asyncio.Future`` for the async path); callers that
   arrive while a fetch is already running wait on it instead of duplicating
   work.
+
+* **Unknown-kid negative cache** (``unknown_kid_ttl``, default 10 s). When a
+  token arrives with a kid we didn't find after a forced refresh, we
+  remember "kid X wasn't in JWKS at time T" and reject subsequent tokens
+  with the same kid for ``unknown_kid_ttl`` seconds without hitting the
+  JWKS endpoint again. Closes the OBS-1 amplification vector: without
+  this, an unauthenticated attacker blasting random kids can turn every
+  failed verification into a JWKS HTTP round-trip against the IdP. 10 s
+  is short enough that a real key rotation lands quickly (the
+  refresh-on-unknown-kid path still runs on the first hit per kid) and
+  long enough to neutralize a tight-loop probe. Sequential coalescing
+  alone doesn't close this — a serial attacker still triggers one fetch
+  per request.
 """
 from __future__ import annotations
 
@@ -61,6 +74,7 @@ class JWKSCache:
         stale_ttl: int = 86400,
         http_timeout: float = 5.0,
         max_urls: int = 8,
+        unknown_kid_ttl: float = 10.0,
     ) -> None:
         self.cache_ttl = cache_ttl
         self.stale_ttl = stale_ttl
@@ -68,6 +82,9 @@ class JWKSCache:
         if max_urls < 1:
             raise ValueError("max_urls must be >= 1")
         self.max_urls = max_urls
+        if unknown_kid_ttl < 0:
+            raise ValueError("unknown_kid_ttl must be >= 0")
+        self.unknown_kid_ttl = unknown_kid_ttl
         # OrderedDict so we can do O(1) LRU eviction via move_to_end / popitem(last=False).
         self._entries: OrderedDict[str, _CacheEntry] = OrderedDict()
         self._lock = threading.Lock()
@@ -79,6 +96,12 @@ class JWKSCache:
         # Both maps are mutated under self._lock.
         self._inflight_sync: dict[str, threading.Event] = {}
         self._inflight_async: dict[str, asyncio.Future[dict[str, RSAPublicKey]]] = {}
+        # Negative cache for unknown kids: (jwks_url → {kid → timestamp}). A
+        # kid that was absent after a forced refresh stays absent for
+        # ``unknown_kid_ttl`` seconds. Scoped per-URL because a kid absent
+        # from one IdP might be present at another. See class docstring +
+        # OBS-1 (kid-amplification vector).
+        self._unknown_kids: dict[str, dict[str, float]] = {}
 
     # ──────────────────────────────────────────────────────────────
     # Test overrides
@@ -132,6 +155,17 @@ class JWKSCache:
             raise JWKSFetchError(f"kid {kid!r} not in JWKS override for {jwks_url}")
 
         now = time.time()
+        # Negative cache short-circuit — closes OBS-1 (kid-amplification DoS).
+        # See class docstring. Check this BEFORE we touch the network so a
+        # tight-loop attacker can't burn a JWKS round-trip per request.
+        with self._lock:
+            neg_ts = self._unknown_kids.get(jwks_url, {}).get(kid)
+        if neg_ts is not None and (now - neg_ts) <= self.unknown_kid_ttl:
+            raise JWKSFetchError(
+                f"kid {kid!r} not found in JWKS at {jwks_url} "
+                f"(negative-cached for {self.unknown_kid_ttl}s)"
+            )
+
         with self._lock:
             entry = self._entries.get(jwks_url)
             if entry is not None:
@@ -171,6 +205,10 @@ class JWKSCache:
                 except Exception as exc:
                     log.warning("JWKS refresh-on-unknown-kid failed for %s: %s", jwks_url, exc)
             if key is None:
+                # Still absent after a forced refresh — record in negative
+                # cache so the next request with the same kid short-circuits.
+                with self._lock:
+                    self._unknown_kids.setdefault(jwks_url, {})[kid] = now
                 raise JWKSFetchError(f"kid {kid!r} not found in JWKS at {jwks_url}")
         return key
 
@@ -190,6 +228,16 @@ class JWKSCache:
             raise JWKSFetchError(f"kid {kid!r} not in JWKS override for {jwks_url}")
 
         now = time.time()
+        # Negative cache short-circuit — closes OBS-1 (kid-amplification DoS).
+        # See class docstring. Mirror of the sync path above.
+        with self._lock:
+            neg_ts = self._unknown_kids.get(jwks_url, {}).get(kid)
+        if neg_ts is not None and (now - neg_ts) <= self.unknown_kid_ttl:
+            raise JWKSFetchError(
+                f"kid {kid!r} not found in JWKS at {jwks_url} "
+                f"(negative-cached for {self.unknown_kid_ttl}s)"
+            )
+
         with self._lock:
             entry = self._entries.get(jwks_url)
             if entry is not None:
@@ -229,6 +277,10 @@ class JWKSCache:
                 except Exception as exc:
                     log.warning("JWKS refresh-on-unknown-kid failed for %s: %s", jwks_url, exc)
             if key is None:
+                # Still absent after a forced refresh — record in negative
+                # cache so the next request with the same kid short-circuits.
+                with self._lock:
+                    self._unknown_kids.setdefault(jwks_url, {})[kid] = now
                 raise JWKSFetchError(f"kid {kid!r} not found in JWKS at {jwks_url}")
         return key
 

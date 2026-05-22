@@ -260,6 +260,84 @@ def test_jwks_cache_unknown_kid_within_ttl_does_not_refetch(cache_with_transport
 
 
 # ──────────────────────────────────────────────────────────────
+# Unknown-kid negative cache (OBS-1 — kid-amplification DoS closure)
+# ──────────────────────────────────────────────────────────────
+def test_unknown_kid_negative_cache_short_circuits(cache_with_transport, transport, keypair):
+    """Tight-loop attacker presenting the SAME unknown kid must not amplify
+    one bogus token into one JWKS fetch per request. The negative cache
+    short-circuits before we touch the network for the duration of
+    ``unknown_kid_ttl``. Closes OBS-1.
+    """
+    transport.payload = _jwks_for(keypair)
+    # Warm the cache with a valid kid (1 fetch).
+    cache_with_transport.get_key(JWKS_URL, keypair.kid)
+    assert transport.calls == 1
+
+    # First request with an unknown kid triggers the refresh-on-unknown path
+    # (a second fetch) and records the kid in the negative cache.
+    with pytest.raises(JWKSFetchError):
+        cache_with_transport.get_key(JWKS_URL, "bogus-kid-1")
+    assert transport.calls == 2
+
+    # Next 10 requests with the SAME unknown kid must NOT touch the network.
+    for _ in range(10):
+        with pytest.raises(JWKSFetchError, match="negative-cached"):
+            cache_with_transport.get_key(JWKS_URL, "bogus-kid-1")
+    assert transport.calls == 2  # still 2 — the negative cache is doing its job
+
+    # A DIFFERENT unknown kid is a new probe — it triggers one more fetch
+    # (because it might be a real new-key rotation). That fetch is then
+    # negative-cached too.
+    with pytest.raises(JWKSFetchError):
+        cache_with_transport.get_key(JWKS_URL, "bogus-kid-2")
+    assert transport.calls == 3
+
+
+def test_unknown_kid_negative_cache_expires_after_ttl(cache_with_transport, transport, keypair):
+    """After ``unknown_kid_ttl`` seconds the negative-cache entry expires and
+    a subsequent request with the same kid will attempt one more refresh
+    (the IdP may have rotated a new kid in by then).
+    """
+    transport.payload = _jwks_for(keypair)
+    cache_with_transport.get_key(JWKS_URL, keypair.kid)  # 1 fetch
+    with pytest.raises(JWKSFetchError):
+        cache_with_transport.get_key(JWKS_URL, "rotated-kid")  # 2nd fetch
+    assert transport.calls == 2
+
+    # Force the negative-cache entry into the past so the TTL is exceeded.
+    cache_with_transport._unknown_kids[JWKS_URL]["rotated-kid"] = (
+        time.time() - cache_with_transport.unknown_kid_ttl - 1
+    )
+
+    # Now the cache entry itself is still fresh (within cache_ttl), so the
+    # next call with the same kid will try the refresh-on-unknown path again.
+    with pytest.raises(JWKSFetchError):
+        cache_with_transport.get_key(JWKS_URL, "rotated-kid")
+    assert transport.calls == 3  # one more refresh attempt after negative TTL expired
+
+
+def test_unknown_kid_ttl_validates():
+    """Negative TTL would be a bug — must reject."""
+    with pytest.raises(ValueError, match="unknown_kid_ttl"):
+        JWKSCache(unknown_kid_ttl=-1.0)
+
+
+def test_unknown_kid_ttl_zero_disables_negative_cache(cache_with_transport, transport, keypair):
+    """``unknown_kid_ttl=0`` means the negative-cache check (``now - ts <= 0``)
+    only matches when timestamps tie exactly — effectively disabling the
+    short-circuit. Useful for tests or callers who want the legacy behavior.
+    """
+    transport.payload = _jwks_for(keypair)
+    cache_with_transport.unknown_kid_ttl = 0
+    cache_with_transport.get_key(JWKS_URL, keypair.kid)  # 1 fetch
+    # Two unknown-kid lookups in sequence trigger TWO refreshes (no short-circuit).
+    for _ in range(2):
+        with pytest.raises(JWKSFetchError):
+            cache_with_transport.get_key(JWKS_URL, "always-unknown")
+    assert transport.calls == 3  # 1 warmup + 2 unknown-kid refreshes
+
+
+# ──────────────────────────────────────────────────────────────
 # Coalesced concurrent fetch (H4)
 # ──────────────────────────────────────────────────────────────
 @pytest.mark.asyncio
