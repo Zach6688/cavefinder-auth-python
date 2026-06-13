@@ -73,7 +73,20 @@ class AuthMiddleware:
         request = Request(scope, receive=receive)
 
         # Public paths (health, static, viewer) bypass auth entirely.
-        if self.config.is_public_path(request.url.path):
+        #
+        # Use the raw ASGI ``scope["path"]``, NOT ``request.url.path``:
+        # ``request.url`` is reconstructed using the Host header, which
+        # Starlette <=1.0.0 does not validate (CVE-2026-48710 "BadHost") — a
+        # crafted Host header can inject a path prefix into
+        # ``request.url.path``. Reading it here would let an attacker make a
+        # PROTECTED route's path match a public prefix and skip auth, while
+        # ASGI routing (which matches on ``scope["path"]``) still dispatches to
+        # the protected handler. ``scope["path"]`` is exactly what the router
+        # matches on, so the auth decision stays consistent with dispatch and
+        # is immune to Host-header poisoning regardless of the Starlette
+        # version. (Defense-in-depth: downstream handlers also call
+        # ``current_user``, but the bypass decision must not be poisonable.)
+        if self.config.is_public_path(scope["path"]):
             await self.app(scope, receive, send)
             return
 
@@ -129,7 +142,8 @@ class AuthMiddleware:
     @staticmethod
     def _wants_json(request: Request) -> bool:
         """True if the client is clearly an API caller, not a browser-navigation request."""
-        if request.url.path.startswith("/api/"):
+        # scope["path"], not the Host-poisonable request.url.path (CVE-2026-48710).
+        if request.scope["path"].startswith("/api/"):
             return True
         accept = request.headers.get("accept", "").lower()
         if "application/json" in accept or "text/event-stream" in accept:

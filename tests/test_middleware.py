@@ -78,6 +78,78 @@ def test_public_path_bypasses_auth_on_viewer(app):
     assert "Public view abc-123" in resp.text
 
 
+async def test_public_path_check_keyed_on_scope_path_not_host(config, monkeypatch):
+    """CVE-2026-48710 "BadHost" regression.
+
+    The public-path bypass MUST be decided on the raw ASGI ``scope['path']``
+    (what the router dispatches on), NOT ``request.url.path`` — the latter is
+    reconstructed using the Host header, which Starlette <=1.0.0 does not
+    validate, so a crafted Host header can poison it. We drive the middleware
+    directly with a scope whose dispatch path is a PROTECTED route while the
+    Host header attempts to inject the public ``/api/healthz`` prefix. The
+    middleware must (a) key the public check on the scope path and (b) NOT
+    bypass auth (no cookie → 401, protected inner app never reached). This is
+    version-independent: it asserts the correct input to the bypass decision
+    regardless of how the installed Starlette reconstructs request.url.path.
+    """
+    from cavefinder_auth.middleware import AuthMiddleware
+
+    # AuthConfig is a frozen dataclass — patch the class method, not the
+    # instance attribute. monkeypatch reverts it after the test.
+    seen_paths: list[str] = []
+    real_is_public = type(config).is_public_path
+
+    def spy(self, path: str) -> bool:
+        seen_paths.append(path)
+        return real_is_public(self, path)
+
+    monkeypatch.setattr(type(config), "is_public_path", spy)
+
+    inner_reached = {"v": False}
+
+    async def inner(scope, receive, send):  # the PROTECTED app behind the mw
+        inner_reached["v"] = True
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"PROTECTED"})
+
+    mw = AuthMiddleware(inner, config=config)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/api/me",                 # PROTECTED dispatch path
+        "raw_path": b"/api/me",
+        "query_string": b"",
+        # Host header attempts to poison a reconstructed url.path toward the
+        # public "/api/healthz" prefix (the BadHost vector).
+        "headers": [(b"host", b"evil.example/api/healthz")],
+        "server": ("testserver", 80),
+        "client": ("1.2.3.4", 5678),
+        "state": {},
+    }
+
+    sent: list[dict] = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    await mw(scope, receive, send)
+
+    # (a) the bypass decision was keyed on the scope path, never a poisoned value.
+    assert seen_paths == ["/api/me"], f"public check saw {seen_paths!r}, not scope path"
+    # (b) the protected route did NOT bypass to the inner app...
+    assert inner_reached["v"] is False, "auth bypassed on a protected scope path"
+    # ...it returned 401 (no cookie on a non-public path).
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    assert start["status"] == 401
+
+
 def test_wrong_issuer_cookie_401s(app, keypair, config):
     # Pre-populate JWKS so middleware doesn't 500 on unknown kid.
     from cavefinder_auth.testing import override_jwks
