@@ -4,6 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cavefinder-auth"
+# 0.2.6 (2026-06-13): DE-DRIFT — folds georef's UserinfoClient connection-pooling
+# + aclose() superset (long-lived pooled httpx.AsyncClient, lazy-built; legacy
+# per-call seam preserved for tests) into the canonical async line, so the
+# georef vendored copy and upstream are byte-identical again — one codebase, no
+# drift. Carries the 0.2.5 CVE-2026-48710 "BadHost" fix unchanged. Consumers on
+# 0.2.5 are a clean ancestor; adopt 0.2.6 on next deploy.
 # 0.2.5 (2026-06-13): SECURITY — canonical family release. The auth-bypass
 # public-path check (and the _wants_json /api/ check) now read the raw ASGI
 # scope["path"] instead of the Host-poisonable request.url.path (CVE-2026-48710
@@ -11,7 +17,7 @@ name = "cavefinder-auth"
 # independent of the Starlette version. Supersedes the georef 0.2.4 vendored
 # fix; every consumer pins this exact version. (NB: the v0.2.0 sync+WebSocket
 # lineage carries the same fix on its own maintenance tag — see CaveLog.)
-version = "0.2.5"
+version = "0.2.6"
 description = "Shared JWT verification + FastAPI middleware for CaveFinder Identity Provider client apps (georef, surveylens, cavefinder)."
 readme = "README.md"
 requires-python = ">=3.11"

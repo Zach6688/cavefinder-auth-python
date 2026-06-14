@@ -24,7 +24,7 @@ from .userinfo import (
     get_user_tier_sync,
 )
 
-__version__ = "0.2.5"
+__version__ = "0.2.6"
 
 __all__ = [
     "__version__",
