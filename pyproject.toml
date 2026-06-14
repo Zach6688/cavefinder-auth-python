@@ -4,7 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cavefinder-auth"
-version = "0.2.0"
+# 0.2.0.1 (2026-06-13): SECURITY maintenance patch of the 0.2.0 sync+WebSocket
+# lineage (the lineage CaveLog pins; the main line diverged to async at 0.2.1+).
+# Keys the auth-bypass public-path check (and the _wants_json /api/ check) on the
+# raw ASGI scope["path"] instead of the Host-poisonable request.url.path
+# (CVE-2026-48710 "BadHost"). Same fix as canonical v0.2.5; carried here so the
+# WebSocket-capable lineage stays available without regressing to async.
+version = "0.2.0.1"
 description = "Shared JWT verification + FastAPI middleware for CaveFinder Identity Provider client apps (georef, surveylens, cavefinder)."
 readme = "README.md"
 requires-python = ">=3.11"
